@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.cache/
+cache/
+output/
+*.tif
+*.tiff
+*.geojson
+*.png
+*.json
+!requirements.txt
+.idea/
+.vscode/

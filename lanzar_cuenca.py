@@ -24,7 +24,7 @@ LON = -56.274458
 
 # Radio inicial del DEM alrededor del punto (km).
 BUFFER_KM = 20.0
-MAX_BUFFER_KM = 80.0
+MAX_BUFFER_KM = 180.0
 
 # Modelo digital del terreno. Elige uno:
 #   "glo30"   Copernicus GLO-30 (~30 m). Superficie: incluye árboles y tejados.

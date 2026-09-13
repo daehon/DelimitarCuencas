@@ -3,12 +3,12 @@
 """
 Delimitación de la cuenca hidrográfica aportante a un punto (lat, lon).
 
-Descarga teselas del Copernicus DEM (GLO-30 / GLO-90) desde AWS Open Data
-(sin credenciales), calcula dirección y acumulación de flujo D8 y exporta
-el polígono de la cuenca.
+Descarga un modelo digital del terreno (Copernicus GLO-30/GLO-90, FABDEM o
+ANADEM), calcula dirección y acumulación de flujo D8 y exporta el polígono
+de la cuenca.
 
 Ejemplo:
-    python delimitar_cuenca.py --lat 43.184 --lon -2.478 --buffer-km 20
+    python delimitar_cuenca.py --lat -25.634 --lon -56.273 --dem anadem --buffer-km 20
 """
 
 from __future__ import annotations
@@ -16,8 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import struct
 import sys
 import warnings
+import zipfile
+import zlib
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +36,7 @@ from rasterio.enums import Resampling
 from rasterio.features import shapes
 from rasterio.merge import merge
 from rasterio.transform import array_bounds, rowcol, xy
-from rasterio.warp import calculate_default_transform, reproject
+from rasterio.warp import calculate_default_transform, reproject, transform_bounds
 from shapely.geometry import mapping, shape
 from shapely.ops import transform as shapely_transform
 from shapely.ops import unary_union
@@ -53,20 +56,68 @@ DIRMAP_D8 = (
 DEM_CATALOGO = {
     "glo30": {
         "nombre": "Copernicus GLO-30",
+        "tipo": "copernicus",
         "url": "https://copernicus-dem-30m.s3.eu-central-1.amazonaws.com",
         "res_arcsec": "10",
         "pixel_m": 30.0,
     },
     "glo90": {
         "nombre": "Copernicus GLO-90",
+        "tipo": "copernicus",
         "url": "https://copernicus-dem-90m.s3.eu-central-1.amazonaws.com",
         "res_arcsec": "30",
         "pixel_m": 90.0,
     },
+    "fabdem": {
+        "nombre": "FABDEM v1.2",
+        "tipo": "fabdem",
+        "url": "https://data.bris.ac.uk/datasets/s5hqmjcdj8yo2ibzi9b4ew3sn",
+        "pixel_m": 30.0,
+    },
+    "anadem": {
+        "nombre": "ANADEM v1",
+        "tipo": "anadem",
+        "url": "https://metadados.snirh.gov.br/files/anadem_v1_tiles",
+        "pixel_m": 30.0,
+    },
 }
 
-USER_AGENT = "DelimitarCuencas/1.0 (Tecnalia)"
+# Copernicus ~90 m a veces se cita como 80 m.
+DEM_ALIAS = {
+    "glo80": "glo90",
+    "copernicus": "glo30",
+    "copernicus30": "glo30",
+    "copernicus90": "glo90",
+}
+
+MGRS_BANDAS = "CDEFGHJKLMNPQRSTUVWX"
+FABDEM_VERSION = "V1-2"
+ANADEM_NOMBRE = "anadem_v1_{gzd}.tif"
+
+USER_AGENT = "DelimitarCuencas/1.0 (Tecnalia; +https://github.com/daehon/DelimitarCuencas)"
 GEOD = Geod(ellps="WGS84")
+_HTTP = None
+
+
+def _sesion_http():
+    global _HTTP
+    if _HTTP is None:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        sesion = requests.Session()
+        sesion.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+        reintentos = Retry(
+            total=4,
+            backoff_factor=1.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD"),
+        )
+        adaptador = HTTPAdapter(max_retries=reintentos)
+        sesion.mount("https://", adaptador)
+        sesion.mount("http://", adaptador)
+        _HTTP = sesion
+    return _HTTP
 
 
 @dataclass
@@ -120,13 +171,21 @@ def utm_epsg(lat: float, lon: float) -> int:
     return (32700 if lat < 0 else 32600) + zona
 
 
-def _descargar_fichero(url: str, destino: Path, timeout: int = 120) -> bool:
+def normalizar_dem(dem: str) -> str:
+    clave = dem.strip().lower()
+    clave = DEM_ALIAS.get(clave, clave)
+    if clave not in DEM_CATALOGO:
+        opciones = ", ".join(sorted(DEM_CATALOGO))
+        raise ValueError(f"DEM desconocido: {dem}. Usa {opciones} (o glo80 = glo90).")
+    return clave
+
+
+def _descargar_fichero(url: str, destino: Path, timeout: int | tuple = (30, 180)) -> bool:
     destino.parent.mkdir(parents=True, exist_ok=True)
     if destino.exists() and destino.stat().st_size > 2048:
         return True
-    headers = {"User-Agent": USER_AGENT}
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=timeout) as resp:
+        with _sesion_http().get(url, stream=True, timeout=timeout) as resp:
             if resp.status_code == 404:
                 return False
             resp.raise_for_status()
@@ -177,9 +236,271 @@ def descargar_dem_copernicus(
             print(f"  Tesela no disponible (océano o no publicada): {nombre}")
     if not rutas:
         raise RuntimeError(
-            "No se descargó ninguna tesela. Prueba otro punto o el DEM glo90."
+            "No se descargó ninguna tesela Copernicus. Prueba glo90, fabdem o anadem."
         )
     return rutas
+
+
+def _fabdem_esquina(lat: int, lon: int) -> str:
+    ns = "N" if lat >= 0 else "S"
+    ew = "E" if lon >= 0 else "W"
+    return f"{ns}{abs(lat):02d}{ew}{abs(lon):03d}"
+
+
+def _fabdem_zip(lat_sw: int, lon_sw: int) -> str:
+    lat0 = math.floor(lat_sw / 10) * 10
+    lon0 = math.floor(lon_sw / 10) * 10
+    sw = _fabdem_esquina(lat0, lon0)
+    ne = _fabdem_esquina(lat0 + 10, lon0 + 10)
+    return f"{sw}-{ne}_FABDEM_{FABDEM_VERSION}.zip"
+
+
+def _http_rango(url: str, inicio: int, fin: int) -> bytes:
+    resp = _sesion_http().get(
+        url,
+        headers={"Range": f"bytes={inicio}-{fin}"},
+        timeout=(30, 180),
+        stream=True,
+    )
+    resp.raise_for_status()
+    if resp.status_code != 206:
+        raise RuntimeError(f"El servidor no admite descarga parcial (HTTP {resp.status_code}).")
+    return resp.content
+
+
+def _fabdem_indice_zip(url: str) -> dict[str, dict]:
+    cabeza = _sesion_http().head(url, allow_redirects=True, timeout=30)
+    cabeza.raise_for_status()
+    tamano = int(cabeza.headers.get("content-length") or 0)
+    if tamano <= 0:
+        raise RuntimeError("No se pudo saber el tamaño del ZIP de FABDEM.")
+    cola = min(tamano, 131072)
+    cola_bytes = _http_rango(url, tamano - cola, tamano - 1)
+    eocd = cola_bytes.rfind(b"PK\x05\x06")
+    if eocd < 0:
+        raise RuntimeError("No se encontró el índice del ZIP remoto de FABDEM.")
+    (
+        _sig,
+        disco,
+        disco_cd,
+        _entradas_disco,
+        total,
+        tam_cd,
+        offset_cd,
+        _comentario,
+    ) = struct.unpack_from("<4s4H2LH", cola_bytes, eocd)
+    if disco or disco_cd or offset_cd == 0xFFFFFFFF:
+        raise RuntimeError("ZIP FABDEM no soportado (multidisco o ZIP64).")
+    directorio = _http_rango(url, offset_cd, offset_cd + tam_cd - 1)
+    entradas: dict[str, dict] = {}
+    pos = 0
+    while pos < len(directorio):
+        if directorio[pos : pos + 4] != b"PK\x01\x02":
+            break
+        (
+            _sig,
+            _ver_m,
+            _ver_n,
+            _flags,
+            metodo,
+            _mt,
+            _md,
+            _crc,
+            tam_comp,
+            tam_raw,
+            n_nombre,
+            n_extra,
+            n_comentario,
+            _disco,
+            _int_attr,
+            _ext_attr,
+            offset_local,
+        ) = struct.unpack_from("<4s6H3L5H2L", directorio, pos)
+        nombre = directorio[pos + 46 : pos + 46 + n_nombre].decode("utf-8", errors="replace")
+        entradas[nombre] = {
+            "metodo": metodo,
+            "tam_comp": tam_comp,
+            "offset_local": offset_local,
+        }
+        pos += 46 + n_nombre + n_extra + n_comentario
+        if len(entradas) >= total:
+            break
+    return entradas
+
+
+def _fabdem_extraer_tesela(url: str, tif_name: str, destino: Path, indice: dict[str, dict]) -> bool:
+    miembro = next(
+        (n for n in indice if Path(n).name.lower() == tif_name.lower()),
+        None,
+    )
+    if miembro is None:
+        print(f"  No está {tif_name} en el ZIP remoto.")
+        return False
+    info = indice[miembro]
+    cab = _http_rango(url, info["offset_local"], info["offset_local"] + 29)
+    if cab[:4] != b"PK\x03\x04":
+        raise RuntimeError("Cabecera ZIP local inválida.")
+    _sig, _ver, _flags, metodo, _mt, _md, _crc, _cs, _us, n_nombre, n_extra = struct.unpack(
+        "<4s5H3L2H", cab
+    )
+    inicio = info["offset_local"] + 30 + n_nombre + n_extra
+    fin = inicio + info["tam_comp"] - 1
+    print(f"  Extrayendo {tif_name} ({info['tam_comp'] / 1e6:.1f} MB del ZIP remoto)…")
+    comprimido = _http_rango(url, inicio, fin)
+    if info["metodo"] == 0:
+        datos = comprimido
+    elif info["metodo"] == 8:
+        datos = zlib.decompress(comprimido, -zlib.MAX_WBITS)
+    else:
+        raise RuntimeError(f"Compresión ZIP no soportada: {info['metodo']}")
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destino.with_suffix(destino.suffix + ".part")
+    tmp.write_bytes(datos)
+    tmp.replace(destino)
+    return True
+
+
+def _extraer_tif_de_zip(zip_path: Path, tif_name: str, destino: Path) -> bool:
+    if destino.exists() and destino.stat().st_size > 2048:
+        return True
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            miembro = next(
+                (n for n in zf.namelist() if Path(n).name.lower() == tif_name.lower()),
+                None,
+            )
+            if miembro is None:
+                print(f"  No está {tif_name} dentro de {zip_path.name}")
+                return False
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            tmp = destino.with_suffix(destino.suffix + ".part")
+            with zf.open(miembro) as src, open(tmp, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 256)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            tmp.replace(destino)
+            return True
+    except zipfile.BadZipFile:
+        print(f"  ZIP corrupto: {zip_path}. Bórralo y vuelve a lanzar.")
+        return False
+
+
+def descargar_dem_fabdem(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    cache_dir: Path,
+) -> list[Path]:
+    cfg = DEM_CATALOGO["fabdem"]
+    teselas = _teselas_para_bbox(south, west, north, east)
+    print(
+        f"DEM {cfg['nombre']}: {len(teselas)} tesela(s) de 1°. "
+        "Se extraen del ZIP remoto (no se baja el archivo de ~2 GB)."
+    )
+    rutas: list[Path] = []
+    indices: dict[str, dict[str, dict]] = {}
+    for lat_sw, lon_sw in teselas:
+        tif_name = f"{_fabdem_esquina(lat_sw, lon_sw)}_FABDEM_{FABDEM_VERSION}.tif"
+        destino = cache_dir / "fabdem" / tif_name
+        if destino.exists() and destino.stat().st_size > 2048:
+            rutas.append(destino)
+            continue
+        zip_name = _fabdem_zip(lat_sw, lon_sw)
+        url = f"{cfg['url']}/{zip_name}"
+        try:
+            if zip_name not in indices:
+                print(f"  Leyendo índice de {zip_name}…")
+                indices[zip_name] = _fabdem_indice_zip(url)
+            if _fabdem_extraer_tesela(url, tif_name, destino, indices[zip_name]):
+                rutas.append(destino)
+                continue
+        except (requests.RequestException, OSError, RuntimeError, struct.error) as exc:
+            print(f"  Aviso: extracción parcial falló ({exc}). Intentando ZIP completo…")
+        zip_path = cache_dir / "fabdem" / zip_name
+        if zip_path.exists() and not zipfile.is_zipfile(zip_path):
+            zip_path.unlink()
+        if _descargar_fichero(url, zip_path, timeout=(30, 300)):
+            if _extraer_tif_de_zip(zip_path, tif_name, destino):
+                rutas.append(destino)
+                continue
+        print(f"  Tesela FABDEM no disponible: {tif_name}")
+    if not rutas:
+        raise RuntimeError(
+            "No se obtuvo ninguna tesela FABDEM. Prueba --dem anadem en Sudamérica."
+        )
+    return rutas
+
+
+def _mgrs_banda(lat: float) -> str:
+    if lat < -80 or lat > 84:
+        raise ValueError("Latitud fuera del sistema MGRS.")
+    idx = int(math.floor((lat + 80.0) / 8.0))
+    idx = min(max(idx, 0), len(MGRS_BANDAS) - 1)
+    return MGRS_BANDAS[idx]
+
+
+def _utm_zona(lon: float) -> int:
+    zona = int((lon + 180) // 6) + 1
+    return min(max(zona, 1), 60)
+
+
+def _anadem_gzds(south: float, west: float, north: float, east: float) -> list[str]:
+    gzds: set[str] = set()
+    n_lat = max(2, int(math.ceil((north - south) / 2.0)) + 1)
+    n_lon = max(2, int(math.ceil((east - west) / 2.0)) + 1)
+    for i in range(n_lat):
+        lat = south + (north - south) * i / (n_lat - 1)
+        for j in range(n_lon):
+            lon = west + (east - west) * j / (n_lon - 1)
+            gzds.add(f"{_utm_zona(lon)}{_mgrs_banda(lat)}")
+    return sorted(gzds)
+
+
+def descargar_dem_anadem(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    cache_dir: Path,
+) -> list[Path]:
+    cfg = DEM_CATALOGO["anadem"]
+    gzds = _anadem_gzds(south, west, north, east)
+    print(f"DEM {cfg['nombre']}: teselas MGRS {', '.join(gzds)}.")
+    rutas: list[Path] = []
+    for gzd in gzds:
+        nombre = ANADEM_NOMBRE.format(gzd=gzd)
+        url = f"{cfg['url']}/{nombre}"
+        destino = cache_dir / "anadem" / nombre
+        if _descargar_fichero(url, destino, timeout=1200):
+            rutas.append(destino)
+        else:
+            print(f"  Tesela ANADEM no disponible: {nombre} (¿fuera de Sudamérica?)")
+    if not rutas:
+        raise RuntimeError(
+            "No se descargó ANADEM. Cubre Sudamérica; en Europa usa glo30, glo90 o fabdem."
+        )
+    return rutas
+
+
+def descargar_dem(
+    south: float,
+    west: float,
+    north: float,
+    east: float,
+    cache_dir: Path,
+    dem: str,
+) -> list[Path]:
+    tipo = DEM_CATALOGO[dem]["tipo"]
+    if tipo == "copernicus":
+        return descargar_dem_copernicus(south, west, north, east, cache_dir, dem=dem)
+    if tipo == "fabdem":
+        return descargar_dem_fabdem(south, west, north, east, cache_dir)
+    if tipo == "anadem":
+        return descargar_dem_anadem(south, west, north, east, cache_dir)
+    raise ValueError(f"Tipo de DEM no implementado: {tipo}")
 
 
 def mosaic_y_reproyectar(
@@ -191,28 +512,36 @@ def mosaic_y_reproyectar(
     south, west, north, east = bounds_wgs
     datasets = [rasterio.open(path) for path in rutas]
     try:
+        src_crs = datasets[0].crs or CRS.from_epsg(4326)
+        src_nodata = datasets[0].nodata
+        left, bottom, right, top = transform_bounds(
+            CRS.from_epsg(4326), src_crs, west, south, east, north, densify_pts=21
+        )
         mosaic, transform = merge(
             datasets,
-            bounds=(west, south, east, north),
+            bounds=(left, bottom, right, top),
             nodata=np.nan,
             dtype="float32",
         )
-        src_crs = datasets[0].crs or CRS.from_epsg(4326)
     finally:
         for ds in datasets:
             ds.close()
 
     dem = mosaic[0].astype(np.float32)
+    if src_nodata is not None and np.isfinite(src_nodata):
+        dem[dem == src_nodata] = np.nan
+    dem[dem <= -1000] = np.nan
     height, width = dem.shape
+    left, bottom, right, top = array_bounds(height, width, transform)
     dst_transform, dst_width, dst_height = calculate_default_transform(
         src_crs,
         dst_crs,
         width,
         height,
-        west,
-        south,
-        east,
-        north,
+        left,
+        bottom,
+        right,
+        top,
         resolution=pixel_m,
     )
     dst = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
@@ -522,72 +851,20 @@ def guardar_raster_cuenca(
         dst.write(data, 1)
 
 
-def pintar_cuenca(
-    dem: np.ndarray,
-    mask: np.ndarray,
-    acc: np.ndarray,
-    transform,
-    lon: float,
-    lat: float,
-    lon_snap: float,
-    lat_snap: float,
-    geom_wgs,
-    area: float,
-    ruta: Path,
-) -> None:
-    west, south, east, north = array_bounds(dem.shape[0], dem.shape[1], transform)
-    to_wgs = Transformer.from_crs(transform, "EPSG:4326", always_xy=True)  # noqa: placeholder
-    # El DEM está en UTM: convertimos extent a WGS84 para superponer el polígono.
-    # Mejor pintar en UTM y transformar los puntos/polígono a UTM.
-    crs_utm = None  # se pasa el extent nativo
-
-    fig, ax = plt.subplots(figsize=(10, 9))
-    dem_plot = np.array(dem, dtype=float)
-    dem_plot[~np.isfinite(dem_plot)] = np.nan
-    ls = LightSource(azdeg=315, altdeg=45)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        shaded = ls.shade(
-            np.nan_to_num(dem_plot, nan=np.nanmedian(dem_plot)),
-            cmap=plt.cm.terrain,
-            vert_exag=2.0,
-            blend_mode="overlay",
-        )
-    ax.imshow(shaded, extent=(west, east, south, north), origin="upper")
-    overlay = np.zeros((*mask.shape, 4), dtype=float)
-    overlay[mask] = (0.05, 0.35, 0.85, 0.35)
-    ax.imshow(overlay, extent=(west, east, south, north), origin="upper")
-
-    streams = mask & (acc >= max(80.0, np.nanpercentile(acc[mask], 92) if mask.any() else 80))
-    stream_rgba = np.zeros((*mask.shape, 4), dtype=float)
-    stream_rgba[streams] = (0.05, 0.15, 0.55, 0.85)
-    ax.imshow(stream_rgba, extent=(west, east, south, north), origin="upper")
-
-    a_utm = None
-    # geom está en WGS84; hay que proyectarlo. Se hace en el llamador pasando
-    # también el CRS. Aquí usamos un truco: dibujar a partir del contour de mask.
-    ax.contour(mask.astype(float), levels=[0.5], colors="white", linewidths=1.2,
-               extent=(west, east, south, north), origin="upper")
-
-    # Puntos: necesitamos coordenadas en el CRS del raster.
-    # Se reciben ya convertidas si se pasan como x_utm, y_utm... mantenemos
-    # firma y convertimos con un transformer que se crea fuera. Para no
-    # complicar, el llamador pasa lon/lat y transformamos con CRS del raster
-    # guardado en un atributo global no. Recalculamos EPSG a partir de west.
-    # west/east son UTM metros, no lon. El llamador debe pasar x,y UTM.
-    _ = (geom_wgs, a_utm, crs_utm, to_wgs)  # silencia análisis estático
-    ax.scatter([lon], [lat], c="red", s=40, zorder=5, label="Punto original", edgecolors="k")
-    ax.scatter([lon_snap], [lat_snap], c="yellow", s=55, zorder=6, marker="x",
-               linewidths=2, label="Punto de cierre")
-    ax.set_title(f"Cuenca aportante — {area:.2f} km²")
-    ax.set_xlabel("Este (m)")
-    ax.set_ylabel("Norte (m)")
-    ax.set_aspect("equal")
-    ax.legend(loc="lower right")
-    fig.tight_layout()
-    ruta.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(ruta, dpi=140)
-    plt.close(fig)
+def _flecha_norte(ax) -> None:
+    ax.annotate(
+        "N",
+        xy=(0.93, 0.90),
+        xytext=(0.93, 0.78),
+        xycoords="axes fraction",
+        textcoords="axes fraction",
+        arrowprops=dict(arrowstyle="-|>", color="k", lw=1.6, mutation_scale=16),
+        ha="center",
+        va="center",
+        fontsize=12,
+        fontweight="bold",
+        zorder=10,
+    )
 
 
 def pintar_cuenca_utm(
@@ -604,13 +881,19 @@ def pintar_cuenca_utm(
     ruta: Path,
 ) -> None:
     west, south, east, north = array_bounds(dem.shape[0], dem.shape[1], transform)
+    extent = (west, east, south, north)
     a_utm = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
     x0, y0 = a_utm(lon, lat)
     xs, ys = a_utm(lon_snap, lat_snap)
 
-    fig, ax = plt.subplots(figsize=(10, 9))
-    dem_plot = np.array(dem, dtype=float)
+    # El ráster GIS tiene la fila 0 al norte. Se voltea para dibujar con
+    # origin="lower" (Y creciente hacia arriba = norte arriba).
+    dem_plot = np.flipud(np.array(dem, dtype=float))
+    mask_plot = np.flipud(np.asarray(mask))
+    acc_plot = np.flipud(np.asarray(acc))
     med = float(np.nanmedian(dem_plot))
+
+    fig, ax = plt.subplots(figsize=(10, 9))
     ls = LightSource(azdeg=315, altdeg=45)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -620,32 +903,35 @@ def pintar_cuenca_utm(
             vert_exag=2.0,
             blend_mode="overlay",
         )
-    ax.imshow(shaded, extent=(west, east, south, north), origin="upper")
-    overlay = np.zeros((*mask.shape, 4), dtype=float)
-    overlay[mask] = (0.05, 0.35, 0.85, 0.38)
-    ax.imshow(overlay, extent=(west, east, south, north), origin="upper")
-    if mask.any():
-        umbral = max(80.0, float(np.nanpercentile(acc[mask], 92)))
-        streams = mask & (acc >= umbral)
-        stream_rgba = np.zeros((*mask.shape, 4), dtype=float)
+    ax.imshow(shaded, extent=extent, origin="lower")
+    overlay = np.zeros((*mask_plot.shape, 4), dtype=float)
+    overlay[mask_plot] = (0.05, 0.35, 0.85, 0.38)
+    ax.imshow(overlay, extent=extent, origin="lower")
+    if mask_plot.any():
+        umbral = max(80.0, float(np.nanpercentile(acc_plot[mask_plot], 92)))
+        streams = mask_plot & (acc_plot >= umbral)
+        stream_rgba = np.zeros((*mask_plot.shape, 4), dtype=float)
         stream_rgba[streams] = (0.02, 0.12, 0.55, 0.9)
-        ax.imshow(stream_rgba, extent=(west, east, south, north), origin="upper")
+        ax.imshow(stream_rgba, extent=extent, origin="lower")
         ax.contour(
-            mask.astype(float),
+            mask_plot.astype(float),
             levels=[0.5],
             colors="white",
             linewidths=1.15,
-            extent=(west, east, south, north),
-            origin="upper",
+            extent=extent,
+            origin="lower",
         )
     ax.scatter([x0], [y0], c="red", s=46, zorder=5, label="Punto original", edgecolors="k")
     ax.scatter([xs], [ys], c="yellow", s=70, zorder=6, marker="x",
                linewidths=2.2, label="Punto de cierre (snap)")
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
     ax.set_title(f"Cuenca aportante — {area:.2f} km²")
     ax.set_xlabel("Este (m)")
     ax.set_ylabel("Norte (m)")
-    ax.set_aspect("equal")
-    ax.legend(loc="lower right", framealpha=0.9)
+    ax.set_aspect("equal", adjustable="box")
+    _flecha_norte(ax)
+    ax.legend(loc="lower left", framealpha=0.9)
     fig.tight_layout()
     ruta.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(ruta, dpi=140)
@@ -706,9 +992,7 @@ def delimitar_cuenca(
 ) -> ResultadoCuenca:
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         raise ValueError("Latitud o longitud fuera de rango.")
-    if dem not in DEM_CATALOGO:
-        raise ValueError(f"DEM desconocido: {dem}. Usa glo30 o glo90.")
-
+    dem = normalizar_dem(dem)
     cfg = DEM_CATALOGO[dem]
     pixel_m = cfg["pixel_m"] if dem_path is None else cfg["pixel_m"]
     dst_crs = CRS.from_epsg(utm_epsg(lat, lon))
@@ -727,7 +1011,7 @@ def delimitar_cuenca(
             )
             fuente = f"local:{dem_path}"
         else:
-            tiles = descargar_dem_copernicus(
+            tiles = descargar_dem(
                 south, west, north, east, Path(cache_dir), dem=dem
             )
             print("Mosaico y reproyección a UTM…")
@@ -759,7 +1043,12 @@ def delimitar_cuenca(
     vals = filled[mask]
     n_celdas = int(mask.sum())
 
-    stem = f"cuenca_{lat:.5f}_{lon:.5f}"
+    clave_salida = "local" if dem_path is not None else dem
+    snap_etiqueta = snap_km if snap else 0.0
+    stem = (
+        f"cuenca_{lat:.5f}_{lon:.5f}_{clave_salida}"
+        f"_buf{buffer_km:g}_max{max_buffer_km:g}_snap{snap_etiqueta:g}"
+    )
     out_dir = Path(out_dir)
     ruta_geojson = out_dir / f"{stem}.geojson"
     ruta_tif = out_dir / f"{stem}.tif"
@@ -777,6 +1066,7 @@ def delimitar_cuenca(
         "elev_max_m": float(np.nanmax(vals)) if n_celdas else None,
         "elev_media_m": float(np.nanmean(vals)) if n_celdas else None,
         "dem": fuente,
+        "dem_id": clave_salida,
         "buffer_km": buffer_actual,
         "truncada": truncated,
         "snap_km": snap_km if snap else 0.0,
@@ -827,8 +1117,7 @@ def delimitar_cuenca(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Delimitá la cuenca hidrográfica aportante a un punto lat/lon "
-        "usando Copernicus DEM en línea."
+        description="Delimita la cuenca hidrográfica aportante a un punto lat/lon."
     )
     p.add_argument("--lat", type=float, required=True, help="Latitud WGS84 (grados)")
     p.add_argument("--lon", type=float, required=True, help="Longitud WGS84 (grados)")
@@ -851,11 +1140,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--dem",
-        choices=sorted(DEM_CATALOGO),
         default="glo30",
-        help="Modelo digital: glo30 (~30 m) o glo90 (~90 m, más rápido)",
+        help="Modelo digital: glo30, glo90 (o glo80), fabdem, anadem",
     )
-    p.add_argument("--dem-path", type=Path, default=None, help="DEM local (GeoTIFF) en vez de Copernicus")
+    p.add_argument("--dem-path", type=Path, default=None, help="DEM local (GeoTIFF) en vez de descargar")
     p.add_argument("--no-snap", action="store_true", help="No ajustar el punto al cauce más cercano")
     p.add_argument("--snap-km", type=float, default=0.4, help="Radio de búsqueda del cauce (km)")
     p.add_argument("--cache-dir", type=Path, default=Path("cache"), help="Caché de teselas")

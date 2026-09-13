@@ -1,0 +1,37 @@
+# Replicar este ambiente en otra máquina
+# Python 3.12+ (este proyecto se creó con Python 3.14.3).
+#
+# --- Windows (PowerShell), en la carpeta del proyecto ---
+#   python --version
+#   python -m venv .venv
+#   .\.venv\Scripts\Activate.ps1
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# --- Linux / macOS ---
+#   python3 --version
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Comprobar:
+#   python -c "import rasterio, shapely, pyproj, matplotlib, requests, tqdm; print('OK')"
+#
+# Desactivar el entorno:
+#   deactivate
+
+# DEM: lectura, mosaico y reproyección de GeoTIFF
+rasterio==1.5.1
+numpy==2.5.3
+
+# Geometrías de la cuenca y área sobre el elipsoide
+shapely==2.1.2
+pyproj==3.8.0
+
+# Descarga de teselas Copernicus DEM
+requests==2.34.2
+tqdm==4.70.1
+
+# Mapa PNG de la cuenca
+matplotlib==3.11.2

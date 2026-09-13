@@ -19,8 +19,8 @@ from pathlib import Path
 from delimitar_cuenca import delimitar_cuenca
 
 # Punto de cierre (desagüe / estación / presa).
-LAT = -25.634817
-LON = -56.274062
+LAT = -25.635004
+LON = -56.274458
 
 # Radio inicial del DEM alrededor del punto (km).
 BUFFER_KM = 20.0
@@ -31,24 +31,24 @@ MAX_BUFFER_KM = 80.0
 #   "glo90"   Copernicus GLO-90 (~90 m; a veces se cita como 80 m). Más rápido.
 #   "fabdem"  Copernicus sin bosque ni edificios (~30 m). Mejor en llanuras.
 #   "anadem"  Terreno de Sudamérica (~30 m). Recomendado en Paraguay.
-DEM = "anadem"
+DEM = "glo30"
 
 # Ajusta el punto al cauce más cercano dentro de SNAP_KM.
 SNAP = True
 SNAP_KM = 0.8
 
-# --- Rugosidad del DEM (D8) -------------------------------------------------
-# El flujo D8 manda toda el agua de cada celda a UN solo vecino (el de mayor
-# pendiente). Un lomo de 1–2 m (ruido, vegetación residual) corta la cuenca
-# y sale demasiado pequeña. Estos dos parámetros relajan ese comportamiento.
+# --- Rugosidad del DEM ------------------------------------------------------
+# D8 manda toda el agua de cada celda a UN vecino (el de mayor pendiente).
+# Un lomo de pocos metros (ruido, vegetación) aísla el punto y la cuenca
+# sale minúscula. LAMINA_M ya no “deja subir” el agua: recorta esos lomos
+# en el mapa, que es lo que realmente conecta el drenaje.
 #
-# LAMINA_M: altura (m) de barreras que el agua puede rebasar. 0 = estricto.
-#   Prueba 1–5. Sube si la cuenca es minúscula; baja si se “desborda” demasiado.
-#
-# SUAVIZADO_M: radio (m) de una media local antes de calcular el flujo.
-#   En DEM de 30 m, 60 ≈ 2 celdas, 90 ≈ 3. 0 = sin suavizar.
-LAMINA_M = 2.0
-SUAVIZADO_M = 60.0
+# LAMINA_M: altura máxima (m) de lomos a rebajar. 0 = no recortar.
+#   En terreno: 2–5. Si usas glo30/glo90 (incluye árboles): prueba 10–20.
+# SUAVIZADO_M: radio (m) de la ventana (media + ancho de lomo a recortar).
+#   En DEM de 30 m, 60 ≈ 2 celdas. En glo90 (~90 m), 120 ≈ 1–2 celdas.
+LAMINA_M = 10.0
+SUAVIZADO_M = 120.0
 
 CARPETA = Path(__file__).resolve().parent
 SALIDA = CARPETA / "output"
@@ -70,7 +70,7 @@ def _parse_args() -> argparse.Namespace:
         "--lamina-m",
         type=float,
         default=LAMINA_M,
-        help="Altura de barreras rebasables (m). 0 = D8 estricto",
+        help="Altura de lomos a recortar (m). 0 = no recortar",
     )
     p.add_argument(
         "--suavizado-m",

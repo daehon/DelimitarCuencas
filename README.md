@@ -107,20 +107,23 @@ El archivo que más se usa después es el **GeoJSON**. El nombre incluye modelo,
 
 ## Cuenca demasiado pequeña: lámina y suavizado
 
-El programa usa **D8**: cada celda del mapa manda **toda** su agua a **un** vecino (el de mayor pendiente hacia abajo). Un resalto de 1–2 m —ruido del DEM, vegetación residual, un píxel mal medido— basta para cortar el flujo y dejar una cuenca minúscula.
+El programa usa **D8**: cada celda manda **toda** su agua a **un** vecino (el de mayor pendiente hacia abajo).
 
-Hay dos parámetros en `lanzar_cuenca.py` (también en la línea de comandos):
+Subir un número “de lámina” en el cálculo de la pendiente **casi no cambia nada**: si hay cualquier bajada local, el agua se va por ahí y no “salta” el lomo. Por eso la cuenca seguía saliendo minúscula. Ahora `LAMINA_M` **recorta** esos lomos en el DEM (los baja al terreno de al lado). Además, al rellenar depresiones se deja una pendiente mínima hacia el desagüe: en llanuras (Paraguay) sin eso todo el llano drena hacia el mismo rumbo y el punto interior queda con unas pocas celdas.
+
+El ajuste al cauce (`SNAP`) sigue el flujo **aguas abajo** hasta un río, en lugar de quedarse en el píxel clicado.
 
 | Parámetro | Qué hace | 0 significa | Valores típicos |
 |---|---|---|---|
-| `LAMINA_M` / `--lamina-m` | El agua puede **rebasar** barreras de hasta esa altura (metros) | D8 estricto: no sube ni un centímetro | 1–5 m. Empieza en **2** |
-| `SUAVIZADO_M` / `--suavizado-m` | Media local del DEM **antes** de calcular el flujo. Atenúa rugosidad de pocas celdas | Sin suavizar | En DEM de 30 m: **60** ≈ 2 celdas, **90** ≈ 3 |
+| `LAMINA_M` / `--lamina-m` | Recorta lomos de hasta esa altura (metros) | No recorta | Terreno: **2–5**. Copernicus (`glo30`/`glo90`, con árboles): **10–20** |
+| `SUAVIZADO_M` / `--suavizado-m` | Radio de la ventana (media + ancho máximo del lomo a recortar) | Sin suavizar ni ensanchar el recorte | DEM 30 m: **60–90**. `glo90`: **120** |
 
 Cómo afinarlos:
 
-1. Si la cuenca es un manchón alrededor del punto: sube `LAMINA_M` (por ejemplo de 2 a 3 o 4).
-2. Si aún se corta en lomos estrechos: sube `SUAVIZADO_M` (60 → 90).
-3. Si el polígono se “desborda” a otra llanura o río: baja `LAMINA_M` o `SUAVIZADO_M`.
+1. Cuenca minúscula: sube `LAMINA_M`. Con `glo30`/`glo90` en bosque, prueba 15 o 20.
+2. Lomos de varias celdas: sube `SUAVIZADO_M` (más ancho de recorte).
+3. El polígono se come otra llanura o río: baja `LAMINA_M` o `SUAVIZADO_M`.
+4. En Paraguay el mapa de superficie (`glo30`/`glo90`) ve las copas: mejor `anadem` o `fabdem`.
 
 Los valores usados quedan en `_meta.json` (`lamina_m`, `suavizado_m`).
 
@@ -160,7 +163,7 @@ En Linux o macOS los mismos pasos están comentados al inicio de `requirements.t
 
 - **“python no se reconoce”**: Python no está en el PATH. Reinstálalo marcando *Add python.exe to PATH*.
 - **La cuenca se corta o parece incompleta**: sube `MAX_BUFFER_KM` y vuelve a lanzar.
-- **La cuenca es minúscula / muy sensible a rugosidades**: sube `LAMINA_M` (1–5 m) y, si hace falta, `SUAVIZADO_M` (60–90 m en DEM de 30 m). Ver la sección *Cuenca demasiado pequeña*.
+- **La cuenca es minúscula / muy sensible a rugosidades**: sube `LAMINA_M` (con `glo90` prueba 15–20 m) y, si hace falta, `SUAVIZADO_M`. Ver la sección *Cuenca demasiado pequeña*. En Paraguay evita `glo30`/`glo90` si puedes usar `anadem` o `fabdem`.
 - **El polígono no parece un río**: acerca el punto al cauce, o deja `SNAP = True`.
 - **En Paraguay o llanuras con vegetación la cuenca sale rara**: no uses `glo30`; cambia a `anadem` o `fabdem`.
 - **ANADEM da error fuera de Sudamérica**: usa `fabdem` o Copernicus.

@@ -601,8 +601,18 @@ def _cargar_dem_local(
     return dst, dst_transform, dst_crs
 
 
-def fill_depressions(dem: np.ndarray) -> np.ndarray:
-    """Relleno de depresiones por Priority-Flood (Barnes et al., 2014)."""
+# Incremento mínimo al rellenar: impone una pendiente hacia el desagüe en los
+# llanos. Sin esto, D8 deja las mesetas drenando todas hacia el mismo rumbo
+# (p. ej. este) y la cuenca de un punto interior sale minúscula.
+_FILL_EPS = 1e-4
+
+
+def fill_depressions(dem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Relleno de depresiones y dirección de flujo (Priority-Flood).
+
+    La dirección se asigna al descubrir cada celda desde el frente más bajo:
+    en llanos el agua drena hacia el desagüe, no hacia un rumbo fijo.
+    """
     import heapq
 
     ny, nx = dem.shape
@@ -620,6 +630,7 @@ def fill_depressions(dem: np.ndarray) -> np.ndarray:
     es_borde = valid & vecino_invalido
 
     filled = dem.astype(np.float64, copy=True)
+    fdir = np.full((ny, nx), 255, dtype=np.uint8)
     visited = ~valid
     heap: list[tuple[float, int, int, int]] = []
     seq = 0
@@ -629,6 +640,7 @@ def fill_depressions(dem: np.ndarray) -> np.ndarray:
         visited[i, j] = True
         seq += 1
 
+    codigo = {(di, dj): k for k, (di, dj) in enumerate(DIRMAP_D8)}
     n_valid = int(valid.sum())
     procesadas = 0
     while heap:
@@ -641,12 +653,45 @@ def fill_depressions(dem: np.ndarray) -> np.ndarray:
             if ni < 0 or nj < 0 or ni >= ny or nj >= nx or visited[ni, nj]:
                 continue
             visited[ni, nj] = True
-            nueva = max(float(filled[ni, nj]), elev)
+            nueva = max(float(filled[ni, nj]), elev + _FILL_EPS)
             filled[ni, nj] = nueva
+            fdir[ni, nj] = codigo[(i - ni, j - nj)]
             heapq.heappush(heap, (nueva, seq, ni, nj))
             seq += 1
     filled[~valid] = np.nan
-    return filled
+    fdir[~valid] = 255
+    return filled, fdir
+
+
+def minimo_local(dem: np.ndarray, radio_px: int) -> np.ndarray:
+    """Mínimo en ventana cuadrada, ignorando nodata."""
+    r = max(1, int(radio_px))
+    ny, nx = dem.shape
+    padded = np.pad(dem.astype(np.float64), r, constant_values=np.nan)
+    capas = [
+        padded[di : di + ny, dj : dj + nx]
+        for di in range(2 * r + 1)
+        for dj in range(2 * r + 1)
+    ]
+    with np.errstate(all="ignore"):
+        return np.nanmin(np.stack(capas, axis=0), axis=0)
+
+
+def brechar_barreras(dem: np.ndarray, lamina_m: float, radio_px: int) -> np.ndarray:
+    """Rebaja lomos más bajos que lamina_m y no más anchos que la ventana.
+
+    D8 no puede “saltar” un resalto si hay cualquier bajada local: hay que
+    recortar el lomo en el DEM. La prominencia se mide respecto al mínimo
+    de la vecindad (radio_px).
+    """
+    if lamina_m <= 0:
+        return dem
+    piso = minimo_local(dem, radio_px)
+    out = dem.astype(np.float64, copy=True)
+    prominencia = out - piso
+    bajar = np.isfinite(prominencia) & (prominencia > 0) & (prominencia <= lamina_m)
+    out[bajar] = piso[bajar]
+    return out
 
 
 def suavizar_dem(dem: np.ndarray, radio_px: int) -> np.ndarray:
@@ -655,9 +700,8 @@ def suavizar_dem(dem: np.ndarray, radio_px: int) -> np.ndarray:
         return dem
     r = int(radio_px)
     valid = np.isfinite(dem)
-    vals = np.pad(np.where(valid, dem.astype(np.float64), 0.0), 0)
-    cnt = np.pad(valid.astype(np.float64), 0)
-    # Prefijo con fila/columna extra de ceros.
+    vals = np.where(valid, dem.astype(np.float64), 0.0)
+    cnt = valid.astype(np.float64)
     ny, nx = dem.shape
     I = np.zeros((ny + 1, nx + 1), dtype=np.float64)
     C = np.zeros((ny + 1, nx + 1), dtype=np.float64)
@@ -677,11 +721,8 @@ def suavizar_dem(dem: np.ndarray, radio_px: int) -> np.ndarray:
     return out
 
 
-def flowdir_d8(dem: np.ndarray, dx: float, dy: float, lamina_m: float = 0.0) -> np.ndarray:
-    """Dirección de flujo D8 (código 0-7). 255 = nodata / sin salida.
-
-    lamina_m: el agua puede rebasar resaltos de hasta esa altura (metros).
-    """
+def flowdir_d8(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """Dirección de flujo D8 (código 0-7). 255 = nodata / sin salida."""
     ny, nx = dem.shape
     dist = np.array(
         [
@@ -699,11 +740,10 @@ def flowdir_d8(dem: np.ndarray, dx: float, dy: float, lamina_m: float = 0.0) -> 
     padded = np.pad(dem, 1, constant_values=np.nan)
     mejor_pendiente = np.full((ny, nx), -np.inf, dtype=np.float64)
     fdir = np.full((ny, nx), 255, dtype=np.uint8)
-    lamina = max(0.0, float(lamina_m))
 
     for code, (di, dj) in enumerate(DIRMAP_D8):
         vecino = padded[1 + di : 1 + di + ny, 1 + dj : 1 + dj + nx]
-        pendiente = (dem + lamina - vecino) / dist[code]
+        pendiente = (dem - vecino) / dist[code]
         mejor = pendiente > mejor_pendiente
         fdir[mejor] = code
         mejor_pendiente[mejor] = pendiente[mejor]
@@ -725,8 +765,8 @@ def flowdir_d8(dem: np.ndarray, dx: float, dy: float, lamina_m: float = 0.0) -> 
 
 def accumulation(fdir: np.ndarray) -> np.ndarray:
     ny, nx = fdir.shape
+    # Las celdas de borde (fdir 255) son desagües: reciben flujo y no lo reenvían.
     acc = np.ones((ny, nx), dtype=np.float64)
-    acc[fdir == 255] = 0
     indeg = np.zeros((ny, nx), dtype=np.int16)
 
     for i in range(ny):
@@ -737,11 +777,11 @@ def accumulation(fdir: np.ndarray) -> np.ndarray:
                 continue
             di, dj = DIRMAP_D8[code]
             ni, nj = i + di, j + dj
-            if 0 <= ni < ny and 0 <= nj < nx and fdir[ni, nj] != 255:
+            if 0 <= ni < ny and 0 <= nj < nx:
                 indeg[ni, nj] += 1
 
     cola: deque[tuple[int, int]] = deque()
-    ii, jj = np.where((indeg == 0) & (fdir != 255))
+    ii, jj = np.where(indeg == 0)
     for i, j in zip(ii.tolist(), jj.tolist()):
         cola.append((i, j))
 
@@ -752,7 +792,7 @@ def accumulation(fdir: np.ndarray) -> np.ndarray:
             continue
         di, dj = DIRMAP_D8[code]
         ni, nj = i + di, j + dj
-        if not (0 <= ni < ny and 0 <= nj < nx) or fdir[ni, nj] == 255:
+        if not (0 <= ni < ny and 0 <= nj < nx):
             continue
         acc[ni, nj] += acc[i, j]
         indeg[ni, nj] -= 1
@@ -769,7 +809,35 @@ def snap_a_cauce(
     radio_px: int,
     umbral: float,
 ) -> tuple[int, int]:
+    """Ajusta el punto al cauce que realmente drena esa celda.
+
+    1) Sigue el flujo D8 aguas abajo (dentro del radio) hasta acc >= umbral.
+    2) Si no hay cauce, elige la celda de mayor acumulación en el círculo.
+    """
     ny, nx = acc.shape
+    row = int(row)
+    col = int(col)
+    radio2 = radio_px ** 2
+
+    i, j = row, col
+    seen: set[tuple[int, int]] = set()
+    for _ in range(radio_px * 6 + 2):
+        if (i, j) in seen:
+            break
+        seen.add((i, j))
+        if int(fdir[i, j]) == 255:
+            break
+        if float(acc[i, j]) >= umbral:
+            return i, j
+        code = int(fdir[i, j])
+        di, dj = DIRMAP_D8[code]
+        ni, nj = i + di, j + dj
+        if not (0 <= ni < ny and 0 <= nj < nx):
+            break
+        if (ni - row) ** 2 + (nj - col) ** 2 > radio2:
+            break
+        i, j = ni, nj
+
     r0 = max(0, row - radio_px)
     r1 = min(ny, row + radio_px + 1)
     c0 = max(0, col - radio_px)
@@ -781,15 +849,11 @@ def snap_a_cauce(
 
     yy, xx = np.ogrid[r0:r1, c0:c1]
     dist2 = (yy - row) ** 2 + (xx - col) ** 2
-    dentro = dist2 <= radio_px**2
-    candidatos = valid & dentro & (ventana >= umbral)
-    if candidatos.any():
-        dist_c = np.where(candidatos, dist2, np.inf)
-        pos = np.unravel_index(np.argmin(dist_c), dist_c.shape)
-        return int(r0 + pos[0]), int(c0 + pos[1])
-
-    dist_v = np.where(valid & dentro, dist2, np.inf)
-    pos = np.unravel_index(np.argmin(dist_v), dist_v.shape)
+    candidatos = valid & (dist2 <= radio2)
+    if not candidatos.any():
+        return row, col
+    acc_win = np.where(candidatos, ventana, -np.inf)
+    pos = np.unravel_index(np.argmax(acc_win), acc_win.shape)
     return int(r0 + pos[0]), int(c0 + pos[1])
 
 
@@ -983,17 +1047,21 @@ def _procesar_dem(
     suavizado_m: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, bool]:
     trabajo = dem
+    radio_suav = 0
     if suavizado_m > 0:
-        radio = max(1, int(round(suavizado_m / pixel_m)))
-        print(f"Suavizando rugosidad (ventana {2 * radio + 1}×{2 * radio + 1} celdas)…")
-        trabajo = suavizar_dem(trabajo, radio)
-    print("Rellenando depresiones…")
-    filled = fill_depressions(trabajo)
-    print(
-        "Calculando dirección y acumulación de flujo D8"
-        + (f" (lámina {lamina_m:g} m)…" if lamina_m > 0 else "…")
-    )
-    fdir = flowdir_d8(filled, pixel_m, pixel_m, lamina_m=lamina_m)
+        radio_suav = max(1, int(round(suavizado_m / pixel_m)))
+        print(f"Suavizando rugosidad (ventana {2 * radio_suav + 1}×{2 * radio_suav + 1} celdas)…")
+        trabajo = suavizar_dem(trabajo, radio_suav)
+    if lamina_m > 0:
+        radio_brecha = radio_suav if radio_suav > 0 else 1
+        print(
+            f"Rebajando barreras ≤ {lamina_m:g} m "
+            f"(ventana {2 * radio_brecha + 1}×{2 * radio_brecha + 1})…"
+        )
+        trabajo = brechar_barreras(trabajo, lamina_m, radio_brecha)
+    print("Rellenando depresiones y asignando dirección de flujo…")
+    filled, fdir = fill_depressions(trabajo)
+    print("Calculando acumulación de flujo…")
     acc = accumulation(fdir)
 
     to_xy = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
@@ -1005,7 +1073,7 @@ def _procesar_dem(
 
     if snap:
         radio_px = max(1, int(round(snap_km * 1000.0 / pixel_m)))
-        umbral = max(40.0, float(np.nanpercentile(acc[acc > 0], 85)) if np.any(acc > 0) else 40.0)
+        umbral = max(30.0, float(np.nanpercentile(acc[acc > 0], 75)) if np.any(acc > 0) else 30.0)
         row, col = snap_a_cauce(acc, fdir, int(row), int(col), radio_px, umbral)
         print(f"Punto ajustado a cauce en fila={row}, col={col} (radio {snap_km} km).")
     else:
@@ -1198,7 +1266,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--lamina-m",
         type=float,
         default=0.0,
-        help="Altura de barreras que el agua puede rebasar (metros). 0 = estricto",
+        help="Altura máxima de lomos a recortar (metros). 0 = no recortar",
     )
     p.add_argument(
         "--suavizado-m",

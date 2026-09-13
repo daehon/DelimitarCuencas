@@ -649,8 +649,39 @@ def fill_depressions(dem: np.ndarray) -> np.ndarray:
     return filled
 
 
-def flowdir_d8(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    """Dirección de flujo D8 (código 0-7). 255 = nodata / sin salida."""
+def suavizar_dem(dem: np.ndarray, radio_px: int) -> np.ndarray:
+    """Media local ignorando nodata. radio_px=1 usa una ventana 3×3."""
+    if radio_px <= 0:
+        return dem
+    r = int(radio_px)
+    valid = np.isfinite(dem)
+    vals = np.pad(np.where(valid, dem.astype(np.float64), 0.0), 0)
+    cnt = np.pad(valid.astype(np.float64), 0)
+    # Prefijo con fila/columna extra de ceros.
+    ny, nx = dem.shape
+    I = np.zeros((ny + 1, nx + 1), dtype=np.float64)
+    C = np.zeros((ny + 1, nx + 1), dtype=np.float64)
+    I[1:, 1:] = np.cumsum(np.cumsum(vals, axis=0), axis=1)
+    C[1:, 1:] = np.cumsum(np.cumsum(cnt, axis=0), axis=1)
+    ii = np.arange(ny)[:, None]
+    jj = np.arange(nx)[None, :]
+    r0 = np.clip(ii - r, 0, ny)
+    c0 = np.clip(jj - r, 0, nx)
+    r1 = np.clip(ii + r + 1, 0, ny)
+    c1 = np.clip(jj + r + 1, 0, nx)
+    s = I[r1, c1] - I[r0, c1] - I[r1, c0] + I[r0, c0]
+    n = C[r1, c1] - C[r0, c1] - C[r1, c0] + C[r0, c0]
+    out = np.full(dem.shape, np.nan, dtype=np.float64)
+    ok = (n > 0) & valid
+    out[ok] = s[ok] / n[ok]
+    return out
+
+
+def flowdir_d8(dem: np.ndarray, dx: float, dy: float, lamina_m: float = 0.0) -> np.ndarray:
+    """Dirección de flujo D8 (código 0-7). 255 = nodata / sin salida.
+
+    lamina_m: el agua puede rebasar resaltos de hasta esa altura (metros).
+    """
     ny, nx = dem.shape
     dist = np.array(
         [
@@ -668,10 +699,11 @@ def flowdir_d8(dem: np.ndarray, dx: float, dy: float) -> np.ndarray:
     padded = np.pad(dem, 1, constant_values=np.nan)
     mejor_pendiente = np.full((ny, nx), -np.inf, dtype=np.float64)
     fdir = np.full((ny, nx), 255, dtype=np.uint8)
+    lamina = max(0.0, float(lamina_m))
 
     for code, (di, dj) in enumerate(DIRMAP_D8):
         vecino = padded[1 + di : 1 + di + ny, 1 + dj : 1 + dj + nx]
-        pendiente = (dem - vecino) / dist[code]
+        pendiente = (dem + lamina - vecino) / dist[code]
         mejor = pendiente > mejor_pendiente
         fdir[mejor] = code
         mejor_pendiente[mejor] = pendiente[mejor]
@@ -947,11 +979,21 @@ def _procesar_dem(
     snap: bool,
     snap_km: float,
     pixel_m: float,
+    lamina_m: float = 0.0,
+    suavizado_m: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, bool]:
+    trabajo = dem
+    if suavizado_m > 0:
+        radio = max(1, int(round(suavizado_m / pixel_m)))
+        print(f"Suavizando rugosidad (ventana {2 * radio + 1}×{2 * radio + 1} celdas)…")
+        trabajo = suavizar_dem(trabajo, radio)
     print("Rellenando depresiones…")
-    filled = fill_depressions(dem)
-    print("Calculando dirección y acumulación de flujo D8…")
-    fdir = flowdir_d8(filled, pixel_m, pixel_m)
+    filled = fill_depressions(trabajo)
+    print(
+        "Calculando dirección y acumulación de flujo D8"
+        + (f" (lámina {lamina_m:g} m)…" if lamina_m > 0 else "…")
+    )
+    fdir = flowdir_d8(filled, pixel_m, pixel_m, lamina_m=lamina_m)
     acc = accumulation(fdir)
 
     to_xy = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
@@ -984,6 +1026,8 @@ def delimitar_cuenca(
     auto_expand: bool = True,
     snap: bool = True,
     snap_km: float = 0.4,
+    lamina_m: float = 0.0,
+    suavizado_m: float = 0.0,
     dem: str = "glo30",
     dem_path: Path | None = None,
     cache_dir: Path = Path("cache"),
@@ -1021,7 +1065,8 @@ def delimitar_cuenca(
             fuente = cfg["nombre"]
 
         filled, acc, mask, row, col, truncated = _procesar_dem(
-            elev, transform, crs, lat, lon, snap, snap_km, pixel_m
+            elev, transform, crs, lat, lon, snap, snap_km, pixel_m,
+            lamina_m=lamina_m, suavizado_m=suavizado_m,
         )
         if truncated and auto_expand and buffer_actual < max_buffer_km - 1e-6:
             nuevo = min(max_buffer_km, buffer_actual * 1.8)
@@ -1048,6 +1093,7 @@ def delimitar_cuenca(
     stem = (
         f"cuenca_{lat:.5f}_{lon:.5f}_{clave_salida}"
         f"_buf{buffer_km:g}_max{max_buffer_km:g}_snap{snap_etiqueta:g}"
+        f"_lam{lamina_m:g}_suav{suavizado_m:g}"
     )
     out_dir = Path(out_dir)
     ruta_geojson = out_dir / f"{stem}.geojson"
@@ -1070,6 +1116,8 @@ def delimitar_cuenca(
         "buffer_km": buffer_actual,
         "truncada": truncated,
         "snap_km": snap_km if snap else 0.0,
+        "lamina_m": lamina_m,
+        "suavizado_m": suavizado_m,
     }
     guardar_geojson(geom, props, ruta_geojson)
     guardar_raster_cuenca(filled, mask, transform, crs, ruta_tif)
@@ -1146,6 +1194,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dem-path", type=Path, default=None, help="DEM local (GeoTIFF) en vez de descargar")
     p.add_argument("--no-snap", action="store_true", help="No ajustar el punto al cauce más cercano")
     p.add_argument("--snap-km", type=float, default=0.4, help="Radio de búsqueda del cauce (km)")
+    p.add_argument(
+        "--lamina-m",
+        type=float,
+        default=0.0,
+        help="Altura de barreras que el agua puede rebasar (metros). 0 = estricto",
+    )
+    p.add_argument(
+        "--suavizado-m",
+        type=float,
+        default=0.0,
+        help="Radio de suavizado del DEM (metros). Reduce rugosidad de pocas celdas",
+    )
     p.add_argument("--cache-dir", type=Path, default=Path("cache"), help="Caché de teselas")
     p.add_argument("--out-dir", type=Path, default=Path("output"), help="Carpeta de resultados")
     p.add_argument("--no-plot", action="store_true", help="No generar la figura PNG")
@@ -1163,6 +1223,8 @@ def main(argv: list[str] | None = None) -> int:
             auto_expand=not args.no_auto_expand,
             snap=not args.no_snap,
             snap_km=args.snap_km,
+            lamina_m=args.lamina_m,
+            suavizado_m=args.suavizado_m,
             dem=args.dem,
             dem_path=args.dem_path,
             cache_dir=args.cache_dir,

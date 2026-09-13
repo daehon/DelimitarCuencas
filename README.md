@@ -52,7 +52,7 @@ Si dice que no se pueden ejecutar scripts:
 
 (La primera vez en un ordenador nuevo, instala las librerías con los pasos de la sección 4.)
 
-### 3. Editar el punto y el modelo
+### 3. Editar el punto, el modelo y (si hace falta) la rugosidad
 
 Abre `lanzar_cuenca.py` y cambia estas líneas (están cerca del principio):
 
@@ -74,7 +74,13 @@ MAX_BUFFER_KM = 80.0
 
 (`BUFFER_KM` es el radio de terreno que se descarga al inicio, en kilómetros.)
 
-Guarda el archivo (Ctrl+S).
+Si la cuenca sale **demasiado pequeña**, ajusta `LAMINA_M` y `SUAVIZADO_M` (ver la sección siguiente).
+
+Guarda el archivo (Ctrl+S). También puedes lanzar sin editar, por ejemplo:
+
+```powershell
+python lanzar_cuenca.py --lamina-m 3 --suavizado-m 90
+```
 
 ### 4. Lanzar
 
@@ -86,16 +92,37 @@ Tardará uno o varios minutos. La primera vez descarga el modelo a la carpeta `c
 
 Los resultados aparecen en **`output/`**, por ejemplo:
 
-`output/cuenca_-25.63428_-56.27282_anadem_buf20_max80_snap0.1`
+`output/cuenca_-25.63482_-56.27406_anadem_buf20_max80_snap0.8_lam2_suav60`
 
 | Archivo | Qué es |
 |---|---|
 | `.geojson` | El polígono de la cuenca. Ábrelo en QGIS, ArcGIS o Google Earth. |
 | `.tif` | El mapa de elevación recortado a la cuenca. |
 | `.png` | Un dibujo para revisar a simple vista (norte arriba). |
-| `_meta.json` | Datos resumidos: área en km², elevaciones, etc. |
+| `_meta.json` | Datos resumidos: área en km², elevaciones, lámina, suavizado, etc. |
 
-El archivo que más se usa después es el **GeoJSON**. El nombre termina con el modelo, el buffer, el buffer máximo y el `snap` (en km), para no pisar resultados de otra ejecución.
+El archivo que más se usa después es el **GeoJSON**. El nombre incluye modelo, buffer, snap, lámina y suavizado, para no pisar resultados de otra ejecución.
+
+---
+
+## Cuenca demasiado pequeña: lámina y suavizado
+
+El programa usa **D8**: cada celda del mapa manda **toda** su agua a **un** vecino (el de mayor pendiente hacia abajo). Un resalto de 1–2 m —ruido del DEM, vegetación residual, un píxel mal medido— basta para cortar el flujo y dejar una cuenca minúscula.
+
+Hay dos parámetros en `lanzar_cuenca.py` (también en la línea de comandos):
+
+| Parámetro | Qué hace | 0 significa | Valores típicos |
+|---|---|---|---|
+| `LAMINA_M` / `--lamina-m` | El agua puede **rebasar** barreras de hasta esa altura (metros) | D8 estricto: no sube ni un centímetro | 1–5 m. Empieza en **2** |
+| `SUAVIZADO_M` / `--suavizado-m` | Media local del DEM **antes** de calcular el flujo. Atenúa rugosidad de pocas celdas | Sin suavizar | En DEM de 30 m: **60** ≈ 2 celdas, **90** ≈ 3 |
+
+Cómo afinarlos:
+
+1. Si la cuenca es un manchón alrededor del punto: sube `LAMINA_M` (por ejemplo de 2 a 3 o 4).
+2. Si aún se corta en lomos estrechos: sube `SUAVIZADO_M` (60 → 90).
+3. Si el polígono se “desborda” a otra llanura o río: baja `LAMINA_M` o `SUAVIZADO_M`.
+
+Los valores usados quedan en `_meta.json` (`lamina_m`, `suavizado_m`).
 
 ---
 
@@ -104,10 +131,10 @@ El archivo que más se usa después es el **GeoJSON**. El nombre termina con el 
 Sirve para no editar `lanzar_cuenca.py`. Con el entorno activado:
 
 ```powershell
-python delimitar_cuenca.py --lat -25.634 --lon -56.273 --dem anadem --buffer-km 20
+python delimitar_cuenca.py --lat -25.634 --lon -56.273 --dem anadem --buffer-km 20 --lamina-m 2 --suavizado-m 60
 ```
 
-Opciones útiles: `--dem`, `--buffer-km`, `--max-buffer-km`, `--no-snap`, `--no-plot`.  
+Opciones útiles: `--dem`, `--buffer-km`, `--max-buffer-km`, `--lamina-m`, `--suavizado-m`, `--no-snap`, `--no-plot`.  
 Lista completa: `python delimitar_cuenca.py --help`.
 
 ---
@@ -133,6 +160,7 @@ En Linux o macOS los mismos pasos están comentados al inicio de `requirements.t
 
 - **“python no se reconoce”**: Python no está en el PATH. Reinstálalo marcando *Add python.exe to PATH*.
 - **La cuenca se corta o parece incompleta**: sube `MAX_BUFFER_KM` y vuelve a lanzar.
+- **La cuenca es minúscula / muy sensible a rugosidades**: sube `LAMINA_M` (1–5 m) y, si hace falta, `SUAVIZADO_M` (60–90 m en DEM de 30 m). Ver la sección *Cuenca demasiado pequeña*.
 - **El polígono no parece un río**: acerca el punto al cauce, o deja `SNAP = True`.
 - **En Paraguay o llanuras con vegetación la cuenca sale rara**: no uses `glo30`; cambia a `anadem` o `fabdem`.
 - **ANADEM da error fuera de Sudamérica**: usa `fabdem` o Copernicus.
